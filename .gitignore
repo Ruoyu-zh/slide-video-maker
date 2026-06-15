@@ -1,0 +1,30 @@
+# Local media and generated artifacts.
+# These may contain private course material, narration, scripts, and rendered videos.
+slides/*
+audio/*
+scripts/*
+output/*
+temp/*
+
+!slides/.gitkeep
+!audio/.gitkeep
+!scripts/.gitkeep
+!output/.gitkeep
+!temp/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs
+*.log
