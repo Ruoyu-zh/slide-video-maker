@@ -7,6 +7,7 @@ Turn a slide deck, per-slide narration audio, and optional scripts into a single
 ## Features / 功能
 
 - Supports one PDF deck or numbered slide images.
+- No fixed page count: use any number of slides as long as the matching audio files are provided.
 - Supports common audio formats, including `.m4a`, `.mp3`, `.wav`, `.aac`, `.flac`, `.ogg`, and `.wma`.
 - Matches slides, audio, and scripts by natural filename order.
 - Exports a single `.mp4` presentation video.
@@ -17,6 +18,7 @@ Turn a slide deck, per-slide narration audio, and optional scripts into a single
   - `aligned-script`: use Whisper timestamps with your original script text.
 
 - 支持直接放入一份 PDF，或放入按编号排列的 slide 图片。
+- 没有固定页数要求：只要 slides 和对应音频数量匹配即可。
 - 支持常见音频格式，包括 `.m4a`、`.mp3`、`.wav`、`.aac`、`.flac`、`.ogg`、`.wma`。
 - 自动按文件名自然排序匹配 slides、audio 和 scripts。
 - 输出一个完整的 `.mp4` 演讲视频。
@@ -109,6 +111,10 @@ scripts/
 Use two-digit filenames such as `01`, `02`, and `03` to keep ordering predictable.
 
 建议使用 `01`、`02`、`03` 这种两位编号，避免排序出错。
+
+There is no required slide count. A 5-page deck needs 5 audio files; a 20-page deck needs 20 audio files. If script subtitles are enabled with `script` or `aligned-script`, provide the same number of `.txt` files as well.
+
+本工具没有固定页数要求。5 页 slides 就放 5 段音频，20 页 slides 就放 20 段音频。如果使用 `script` 或 `aligned-script` 字幕模式，也需要提供相同数量的 `.txt` 台词文件。
 
 ## Basic Usage / 基础用法
 
