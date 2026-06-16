@@ -3,12 +3,14 @@
 slides/*
 audio/*
 scripts/*
+subtitle_overrides/*
 output/*
 temp/*
 
 !slides/.gitkeep
 !audio/.gitkeep
 !scripts/.gitkeep
+!subtitle_overrides/.gitkeep
 !output/.gitkeep
 !temp/.gitkeep
 

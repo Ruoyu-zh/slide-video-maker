@@ -207,6 +207,22 @@ def scale_srt_file(source: Path, target: Path, scale: float) -> None:
     target.write_text(scaled, encoding="utf-8")
 
 
+def offset_srt_file(source: Path, target: Path, offset: float) -> None:
+    text = source.read_text(encoding="utf-8", errors="replace")
+
+    def replace_timing(match: re.Match[str]) -> str:
+        start = format_srt_time(max(0.0, parse_srt_time(match.group(1)) + offset))
+        end = format_srt_time(max(0.25, parse_srt_time(match.group(2)) + offset))
+        return f"{start} --> {end}"
+
+    shifted = re.sub(
+        r"(\d+:\d+:\d+,\d+)\s+-->\s+(\d+:\d+:\d+,\d+)",
+        replace_timing,
+        text,
+    )
+    target.write_text(shifted, encoding="utf-8")
+
+
 def atempo_filter(speed: float) -> str:
     if speed <= 0:
         raise SystemExit(f"Audio speed must be positive, got: {speed}")
@@ -262,14 +278,23 @@ def write_segment_srt(
     srt_path.write_text("\n".join(entries), encoding="utf-8")
 
 
-def parse_srt_timings(srt_path: Path) -> list[tuple[str, str]]:
+def parse_srt_entries(srt_path: Path) -> list[tuple[float, float, str]]:
     text = srt_path.read_text(encoding="utf-8", errors="replace")
-    timings: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        if " --> " in line:
-            start, end = line.split(" --> ", 1)
-            timings.append((start.strip(), end.strip()))
-    return timings
+    entries: list[tuple[float, float, str]] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(lines) < 3 or " --> " not in lines[1]:
+            continue
+        start, end = lines[1].split(" --> ", 1)
+        entries.append((parse_srt_time(start), parse_srt_time(end), " ".join(lines[2:])))
+    return entries
+
+
+def parse_srt_timings(srt_path: Path) -> list[tuple[str, str]]:
+    return [
+        (format_srt_time(start), format_srt_time(end))
+        for start, end, _text in parse_srt_entries(srt_path)
+    ]
 
 
 def chunk_script_by_count(text: str, count: int) -> list[str]:
@@ -301,6 +326,81 @@ def write_aligned_script_srt(script_path: Path, timing_srt: Path, output_srt: Pa
     output_srt.write_text("\n".join(entries), encoding="utf-8")
 
 
+def words_in_text(text: str) -> list[str]:
+    return re.findall(r"[\w']+", text.lower())
+
+
+def seconds_at_word_position(
+    position: float,
+    entries: list[tuple[float, float, str]],
+    total_words: int,
+) -> float:
+    if not entries:
+        return 0.0
+    if position <= 0:
+        return entries[0][0]
+
+    cumulative = 0
+    fallback_words = max(total_words, 1)
+    for start, end, text in entries:
+        count = max(len(words_in_text(text)), 1)
+        next_cumulative = cumulative + count
+        if position <= next_cumulative:
+            ratio = (position - cumulative) / count
+            return start + (end - start) * max(0.0, min(1.0, ratio))
+        cumulative = next_cumulative
+
+    transcript_words = max(cumulative, fallback_words, 1)
+    ratio = min(position / transcript_words, 1.0)
+    first_start = entries[0][0]
+    last_end = entries[-1][1]
+    return first_start + (last_end - first_start) * ratio
+
+
+def write_content_aligned_script_srt(
+    script_path: Path,
+    timing_srt: Path,
+    output_srt: Path,
+    max_words: int,
+) -> None:
+    timing_entries = parse_srt_entries(timing_srt)
+    if not timing_entries:
+        raise SystemExit(f"No timings found in Whisper SRT: {timing_srt}")
+
+    script_text = script_path.read_text(encoding="utf-8")
+    chunks = chunk_script_text(script_text, max_words=max_words)
+    total_script_words = max(len(words_in_text(script_text)), 1)
+    total_timing_words = sum(max(len(words_in_text(text)), 1) for _, _, text in timing_entries)
+
+    position = 0.0
+    entries: list[str] = []
+    for index, chunk in enumerate(chunks, start=1):
+        chunk_words = max(len(words_in_text(chunk)), 1)
+        start_position = position * total_timing_words / total_script_words
+        end_position = (position + chunk_words) * total_timing_words / total_script_words
+        start = seconds_at_word_position(start_position, timing_entries, total_timing_words)
+        end = seconds_at_word_position(end_position, timing_entries, total_timing_words)
+        end = max(start + 0.25, end)
+        entries.append(
+            f"{index}\n{format_srt_time(start)} --> {format_srt_time(end)}\n{chunk}\n"
+        )
+        position += chunk_words
+
+    output_srt.write_text("\n".join(entries), encoding="utf-8")
+
+
+def find_subtitle_override(index: int, args: argparse.Namespace) -> Path | None:
+    override_dir = args.subtitle_overrides_dir.resolve()
+    candidates = [
+        override_dir / f"{index:02d}.srt",
+        override_dir / f"{index}.srt",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def ffmpeg_subtitle_path(path: Path) -> str:
     value = path.resolve().as_posix()
     if len(value) >= 3 and value[1] == ":":
@@ -319,7 +419,12 @@ def make_clip(
     clip_path = clip_dir / f"{index:02d}.mp4"
     audio_speed = args.audio_speed_map.get(index, 1.0)
     subtitle_scale = 1.0 / audio_speed
+    font_size = int(args.subtitle_font_size_map.get(index, args.font_size))
     margin_v = int(args.subtitle_margin_map.get(index, args.margin_v))
+    alignment = int(args.subtitle_alignment_map.get(index, args.subtitle_alignment))
+    margin_l = int(args.subtitle_left_margin_map.get(index, args.subtitle_left_margin))
+    margin_r = int(args.subtitle_right_margin_map.get(index, args.subtitle_right_margin))
+    subtitle_offset = args.subtitle_offset_map.get(index, 0.0)
     filters = [
         (
             f"scale={args.width}:{args.height}:force_original_aspect_ratio=decrease,"
@@ -329,7 +434,10 @@ def make_clip(
     ]
 
     if args.burn_scripts:
-        if args.subtitle_source == "whisper":
+        override_path = find_subtitle_override(index, args)
+        if override_path is not None:
+            srt_path = override_path
+        elif args.subtitle_source == "whisper":
             srt_path = make_whisper_srt(index, audio, args)
         elif args.subtitle_source == "aligned-script":
             if script is None:
@@ -339,6 +447,19 @@ def make_clip(
             timing_srt = make_whisper_srt(index, audio, args)
             srt_path = clip_dir / f"{index:02d}_aligned_script.srt"
             write_aligned_script_srt(script, timing_srt, srt_path)
+        elif args.subtitle_source == "content-aligned-script":
+            if script is None:
+                raise SystemExit(
+                    "Content-aligned script subtitle mode requires one .txt file per slide in scripts/."
+                )
+            timing_srt = make_whisper_srt(index, audio, args)
+            srt_path = clip_dir / f"{index:02d}_content_aligned_script.srt"
+            write_content_aligned_script_srt(
+                script,
+                timing_srt,
+                srt_path,
+                args.subtitle_max_words,
+            )
         else:
             if script is None:
                 raise SystemExit(
@@ -351,14 +472,22 @@ def make_clip(
                 get_media_duration(audio) * subtitle_scale,
                 args.subtitle_offset,
             )
-        if audio_speed != 1.0 and args.subtitle_source in {"whisper", "aligned-script"}:
+        if audio_speed != 1.0 and args.subtitle_source != "script":
             scaled_srt_path = clip_dir / f"{index:02d}_speed_scaled.srt"
             scale_srt_file(srt_path, scaled_srt_path, subtitle_scale)
             srt_path = scaled_srt_path
+        if subtitle_offset != 0.0 and args.subtitle_source != "script":
+            offset_srt_path = clip_dir / f"{index:02d}_offset.srt"
+            offset_srt_file(srt_path, offset_srt_path, subtitle_offset)
+            srt_path = offset_srt_path
         filters.append(
             "subtitles='"
             + ffmpeg_subtitle_path(srt_path)
-            + f"':force_style='Fontsize={args.font_size},Outline=1,Shadow=0,MarginV={margin_v}'"
+            + (
+                f"':force_style='Fontsize={font_size},Outline=1,Shadow=0,"
+                f"Alignment={alignment},MarginL={margin_l},MarginR={margin_r},"
+                f"MarginV={margin_v}'"
+            )
         )
 
     command = [
@@ -479,11 +608,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--width", type=int, default=1920)
     parser.add_argument("--height", type=int, default=1080)
     parser.add_argument("--font-size", type=int, default=12)
+    parser.add_argument(
+        "--subtitle-font-size-map",
+        default="",
+        help="Per-segment subtitle font sizes, for example: 3=8,8=8",
+    )
     parser.add_argument("--margin-v", type=int, default=36)
+    parser.add_argument("--subtitle-alignment", type=int, default=2)
+    parser.add_argument("--subtitle-left-margin", type=int, default=10)
+    parser.add_argument("--subtitle-right-margin", type=int, default=10)
     parser.add_argument(
         "--subtitle-margin-map",
         default="",
         help="Per-segment subtitle bottom margins, for example: 3=8,5=8,9=8",
+    )
+    parser.add_argument(
+        "--subtitle-alignment-map",
+        default="",
+        help="Per-segment ASS subtitle alignment numbers, for example: 3=1,8=1",
+    )
+    parser.add_argument(
+        "--subtitle-left-margin-map",
+        default="",
+        help="Per-segment subtitle left margins, for example: 3=40,8=40",
+    )
+    parser.add_argument(
+        "--subtitle-right-margin-map",
+        default="",
+        help="Per-segment subtitle right margins, for example: 3=1150,8=1150",
     )
     parser.add_argument(
         "--subtitle-offset",
@@ -492,10 +644,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Shift burned script subtitles in seconds. Negative values show subtitles earlier.",
     )
     parser.add_argument(
+        "--subtitle-offset-map",
+        default="",
+        help="Per-segment subtitle offsets in seconds, for example: 3=-0.6,8=-0.6",
+    )
+    parser.add_argument(
         "--subtitle-source",
-        choices=["script", "whisper", "aligned-script"],
+        choices=["script", "whisper", "aligned-script", "content-aligned-script"],
         default="script",
         help="Use script text timing or Whisper-generated audio timing for burned subtitles.",
+    )
+    parser.add_argument(
+        "--subtitle-max-words",
+        type=int,
+        default=16,
+        help="Maximum words per generated script subtitle chunk.",
+    )
+    parser.add_argument(
+        "--subtitle-overrides-dir",
+        type=Path,
+        default=PROJECT_ROOT / "subtitle_overrides",
+        help="Optional per-slide SRT overrides, such as subtitle_overrides/07.srt.",
     )
     parser.add_argument("--whisper-model", default="base")
     parser.add_argument("--whisper-language", default="English")
@@ -525,7 +694,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    args.subtitle_font_size_map = parse_index_float_map(args.subtitle_font_size_map)
     args.subtitle_margin_map = parse_index_float_map(args.subtitle_margin_map)
+    args.subtitle_alignment_map = parse_index_float_map(args.subtitle_alignment_map)
+    args.subtitle_left_margin_map = parse_index_float_map(args.subtitle_left_margin_map)
+    args.subtitle_right_margin_map = parse_index_float_map(args.subtitle_right_margin_map)
+    args.subtitle_offset_map = parse_index_float_map(args.subtitle_offset_map)
     args.audio_speed_map = parse_index_float_map(args.audio_speed_map)
     enable_packaged_ffmpeg()
     require_ffmpeg()
