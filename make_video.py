@@ -154,6 +154,74 @@ def get_media_duration(path: Path) -> float:
     return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
+def parse_index_float_map(value: str) -> dict[int, float]:
+    result: dict[int, float] = {}
+    if not value.strip():
+        return result
+
+    for item in value.split(","):
+        if not item.strip():
+            continue
+        if "=" not in item:
+            raise SystemExit(
+                f"Invalid map item {item!r}. Expected format like: 6=0.9,9=0.9"
+            )
+        key, raw_number = item.split("=", 1)
+        try:
+            index = int(key.strip())
+            number = float(raw_number.strip())
+        except ValueError as exc:
+            raise SystemExit(f"Invalid map item {item!r}.") from exc
+        if index <= 0:
+            raise SystemExit(f"Segment index must be positive: {item!r}")
+        result[index] = number
+    return result
+
+
+def parse_srt_time(value: str) -> float:
+    match = re.match(r"(\d+):(\d+):(\d+),(\d+)", value.strip())
+    if not match:
+        raise SystemExit(f"Invalid SRT timestamp: {value}")
+    hours, minutes, seconds, milliseconds = match.groups()
+    return (
+        int(hours) * 3600
+        + int(minutes) * 60
+        + int(seconds)
+        + int(milliseconds) / 1000
+    )
+
+
+def scale_srt_file(source: Path, target: Path, scale: float) -> None:
+    text = source.read_text(encoding="utf-8", errors="replace")
+
+    def replace_timing(match: re.Match[str]) -> str:
+        start = format_srt_time(parse_srt_time(match.group(1)) * scale)
+        end = format_srt_time(parse_srt_time(match.group(2)) * scale)
+        return f"{start} --> {end}"
+
+    scaled = re.sub(
+        r"(\d+:\d+:\d+,\d+)\s+-->\s+(\d+:\d+:\d+,\d+)",
+        replace_timing,
+        text,
+    )
+    target.write_text(scaled, encoding="utf-8")
+
+
+def atempo_filter(speed: float) -> str:
+    if speed <= 0:
+        raise SystemExit(f"Audio speed must be positive, got: {speed}")
+    filters: list[str] = []
+    remaining = speed
+    while remaining < 0.5:
+        filters.append("atempo=0.5")
+        remaining /= 0.5
+    while remaining > 2.0:
+        filters.append("atempo=2.0")
+        remaining /= 2.0
+    filters.append(f"atempo={remaining:.6g}")
+    return ",".join(filters)
+
+
 def chunk_script_text(text: str, max_words: int = 16) -> list[str]:
     normalized = " ".join(text.split())
     if not normalized:
@@ -249,6 +317,9 @@ def make_clip(
     clip_dir: Path,
 ) -> Path:
     clip_path = clip_dir / f"{index:02d}.mp4"
+    audio_speed = args.audio_speed_map.get(index, 1.0)
+    subtitle_scale = 1.0 / audio_speed
+    margin_v = int(args.subtitle_margin_map.get(index, args.margin_v))
     filters = [
         (
             f"scale={args.width}:{args.height}:force_original_aspect_ratio=decrease,"
@@ -277,27 +348,35 @@ def make_clip(
             write_segment_srt(
                 script,
                 srt_path,
-                get_media_duration(audio),
+                get_media_duration(audio) * subtitle_scale,
                 args.subtitle_offset,
             )
+        if audio_speed != 1.0 and args.subtitle_source in {"whisper", "aligned-script"}:
+            scaled_srt_path = clip_dir / f"{index:02d}_speed_scaled.srt"
+            scale_srt_file(srt_path, scaled_srt_path, subtitle_scale)
+            srt_path = scaled_srt_path
         filters.append(
             "subtitles='"
             + ffmpeg_subtitle_path(srt_path)
-            + f"':force_style='Fontsize={args.font_size},Outline=1,Shadow=0,MarginV={args.margin_v}'"
+            + f"':force_style='Fontsize={args.font_size},Outline=1,Shadow=0,MarginV={margin_v}'"
         )
 
-    run(
+    command = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        str(slide),
+        "-i",
+        str(audio),
+        "-vf",
+        ",".join(filters),
+    ]
+    if audio_speed != 1.0:
+        command.extend(["-af", atempo_filter(audio_speed)])
+    command.extend(
         [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-i",
-            str(slide),
-            "-i",
-            str(audio),
-            "-vf",
-            ",".join(filters),
             "-c:v",
             "libx264",
             "-tune",
@@ -313,6 +392,9 @@ def make_clip(
             "-shortest",
             str(clip_path),
         ]
+    )
+    run(
+        command
     )
     return clip_path
 
@@ -399,6 +481,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--font-size", type=int, default=12)
     parser.add_argument("--margin-v", type=int, default=36)
     parser.add_argument(
+        "--subtitle-margin-map",
+        default="",
+        help="Per-segment subtitle bottom margins, for example: 3=8,5=8,9=8",
+    )
+    parser.add_argument(
         "--subtitle-offset",
         type=float,
         default=0.0,
@@ -419,6 +506,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--audio-bitrate", default="192k")
     parser.add_argument(
+        "--audio-speed-map",
+        default="",
+        help="Per-segment audio speed factors, for example: 6=0.9,9=0.9,11=0.9",
+    )
+    parser.add_argument(
         "--burn-scripts",
         action="store_true",
         help="Burn each script text file into its matching slide segment.",
@@ -433,6 +525,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = build_parser().parse_args()
+    args.subtitle_margin_map = parse_index_float_map(args.subtitle_margin_map)
+    args.audio_speed_map = parse_index_float_map(args.audio_speed_map)
     enable_packaged_ffmpeg()
     require_ffmpeg()
 
